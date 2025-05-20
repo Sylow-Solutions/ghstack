@@ -79,46 +79,101 @@ class RealGitHubEndpoint(ghstack.github.GitHubEndpoint):
         if self.oauth_token:
             headers["Authorization"] = "bearer {}".format(self.oauth_token)
 
-        logging.debug(
-            "# POST {}".format(self.graphql_endpoint.format(github_url=self.github_url))
-        )
+        endpoint = self.graphql_endpoint.format(github_url=self.github_url)
+        logging.debug(f"# POST {endpoint}")
         logging.debug("Request GraphQL query:\n{}".format(query))
         logging.debug(
             "Request GraphQL variables:\n{}".format(json.dumps(kwargs, indent=1))
         )
 
-        resp = requests.post(
-            self.graphql_endpoint.format(github_url=self.github_url),
-            json={"query": query, "variables": kwargs},
-            headers=headers,
-            proxies=self._proxies(),
-            verify=self.verify,
-            cert=self.cert,
-        )
-
-        logging.debug("Response status: {}".format(resp.status_code))
-
         try:
-            r = resp.json()
-        except ValueError:
-            logging.debug("Response body:\n{}".format(resp.text))
-            raise
-        else:
+            resp = requests.post(
+                endpoint,
+                json={"query": query, "variables": kwargs},
+                headers=headers,
+                proxies=self._proxies(),
+                verify=self.verify,
+                cert=self.cert,
+            )
+
+            logging.debug(f"Response status: {resp.status_code}")
+            
+            # Log response content for debugging
+            if resp.status_code != 200:
+                logging.error(f"Error response from GitHub API: {resp.status_code}")
+                logging.error(f"Response headers: {resp.headers}")
+                logging.error(f"Response text: {resp.text[:1000]}")  # Limit to first 1000 chars
+                
+                if resp.status_code == 401:
+                    raise RuntimeError(
+                        "GitHub API returned 401 Unauthorized. Your OAuth token may be invalid or expired. "
+                        "For private repositories, make sure your token has the 'repo' scope."
+                    )
+                elif resp.status_code == 403:
+                    raise RuntimeError(
+                        "GitHub API returned 403 Forbidden. You might not have permission to access this repository, "
+                        "or your OAuth token might not have sufficient permissions."
+                    )
+                elif resp.status_code == 404:
+                    raise RuntimeError(
+                        "GitHub API returned 404 Not Found. The repository might not exist, "
+                        "or you might not have access to it."
+                    )
+                
+                # Always raise for status to trigger general error handling
+                resp.raise_for_status()
+
+            try:
+                r = resp.json()
+            except ValueError as e:
+                logging.error(f"Failed to parse JSON response: {str(e)}")
+                logging.error(f"Response text: {resp.text[:1000]}")  # Limit to first 1000 chars
+                
+                # Check if response might be HTML (often an error page)
+                if resp.text.strip().startswith(("<!DOCTYPE", "<html")):
+                    logging.error("Response appears to be HTML instead of JSON - likely an error page")
+                    
+                    # Extract title if possible for more context
+                    title_match = re.search(r"<title>(.*?)</title>", resp.text, re.DOTALL)
+                    if title_match:
+                        error_title = title_match.group(1).strip()
+                        logging.error(f"Error page title: {error_title}")
+                
+                raise RuntimeError(
+                    "GitHub API returned a non-JSON response. This could indicate:\n"
+                    "1. Network connectivity issues\n"
+                    "2. Authentication problems with your OAuth token\n"
+                    "3. GitHub API endpoint might be incorrect or unavailable\n\n"
+                    f"Status code: {resp.status_code}"
+                ) from e
+            
             pretty_json = json.dumps(r, indent=1)
             logging.debug("Response JSON:\n{}".format(pretty_json))
 
-        # Actually, this code is dead on the GitHub GraphQL API, because
-        # they seem to always return 200, even in error case (as of
-        # 11/5/2018)
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError:
-            raise RuntimeError(pretty_json)
+            if "errors" in r:
+                logging.error(f"GraphQL errors: {json.dumps(r['errors'], indent=2)}")
+                
+                # Check for common authorization errors
+                for error in r.get("errors", []):
+                    if "type" in error and error["type"] == "FORBIDDEN":
+                        raise RuntimeError(
+                            "GitHub GraphQL API returned a FORBIDDEN error. "
+                            "For private repositories, make sure your OAuth token has the 'repo' scope."
+                        )
+                
+                raise RuntimeError(pretty_json)
 
-        if "errors" in r:
-            raise RuntimeError(pretty_json)
-
-        return r
+            return r
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Request exception: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                logging.error(f"Response status: {e.response.status_code}")
+                logging.error(f"Response text: {e.response.text[:1000]}")
+            
+            raise RuntimeError(
+                f"Failed to connect to GitHub API: {str(e)}\n"
+                "Please check your network connection and GitHub API endpoint configuration."
+            ) from e
 
     def _proxies(self) -> Dict[str, str]:
         if self.proxy:
@@ -159,81 +214,129 @@ class RealGitHubEndpoint(ghstack.github.GitHubEndpoint):
         }
 
         url = self.rest_endpoint.format(github_url=self.github_url) + "/" + path
+        logging.debug(f"# {method.upper()} {url}")
+        logging.debug("Request body:\n{}".format(json.dumps(kwargs, indent=1)))
 
         backoff_seconds = INITIAL_BACKOFF_SECONDS
         for attempt in range(0, MAX_RETRIES):
-            logging.debug("# {} {}".format(method, url))
-            logging.debug("Request body:\n{}".format(json.dumps(kwargs, indent=1)))
-
-            resp: requests.Response = getattr(requests, method)(
-                url,
-                json=kwargs,
-                headers=headers,
-                proxies=self._proxies(),
-                verify=self.verify,
-                cert=self.cert,
-            )
-
-            logging.debug("Response status: {}".format(resp.status_code))
-
             try:
-                r = resp.json()
-            except ValueError:
-                logging.debug("Response body:\n{}".format(r.text))
-                raise
-            else:
-                pretty_json = json.dumps(r, indent=1)
-                logging.debug("Response JSON:\n{}".format(pretty_json))
+                resp: requests.Response = getattr(requests, method)(
+                    url,
+                    json=kwargs,
+                    headers=headers,
+                    proxies=self._proxies(),
+                    verify=self.verify,
+                    cert=self.cert,
+                )
 
-            # Per Github rate limiting: https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28#exceeding-the-rate-limit
-            if resp.status_code in (403, 429):
-                remaining_count = resp.headers.get("x-ratelimit-remaining")
-                reset_time = resp.headers.get("x-ratelimit-reset")
+                logging.debug(f"Response status: {resp.status_code}")
 
-                if remaining_count == "0" and reset_time:
-                    sleep_time = int(reset_time) - int(time.time())
-                    logging.warning(
-                        f"Rate limit exceeded. Sleeping until reset in {sleep_time} seconds."
-                    )
-                    time.sleep(sleep_time)
-                    continue
-                else:
-                    retry_after_seconds = resp.headers.get("retry-after")
-                    if retry_after_seconds:
-                        sleep_time = int(retry_after_seconds)
+                # Log response content for debugging non-200 responses
+                if resp.status_code != 200:
+                    logging.error(f"Error response from GitHub API: {resp.status_code}")
+                    logging.error(f"Response headers: {resp.headers}")
+                    logging.error(f"Response text: {resp.text[:1000]}")  # Limit to first 1000 chars
+
+                # Per Github rate limiting: https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api?apiVersion=2022-11-28#exceeding-the-rate-limit
+                if resp.status_code in (403, 429):
+                    remaining_count = resp.headers.get("x-ratelimit-remaining")
+                    reset_time = resp.headers.get("x-ratelimit-reset")
+
+                    if remaining_count == "0" and reset_time:
+                        sleep_time = int(reset_time) - int(time.time())
                         logging.warning(
-                            f"Secondary rate limit hit. Sleeping for {sleep_time} seconds."
+                            f"Rate limit exceeded. Sleeping until reset in {sleep_time} seconds."
                         )
+                        time.sleep(sleep_time)
+                        continue
                     else:
-                        sleep_time = backoff_seconds
-                        logging.warning(
-                            f"Secondary rate limit hit. Sleeping for {sleep_time} seconds (exponential backoff)."
-                        )
-                        backoff_seconds *= 2
-                    time.sleep(sleep_time)
-                    continue
+                        retry_after_seconds = resp.headers.get("retry-after")
+                        if retry_after_seconds:
+                            sleep_time = int(retry_after_seconds)
+                            logging.warning(
+                                f"Secondary rate limit hit. Sleeping for {sleep_time} seconds."
+                            )
+                        else:
+                            sleep_time = backoff_seconds
+                            logging.warning(
+                                f"Secondary rate limit hit. Sleeping for {sleep_time} seconds (exponential backoff)."
+                            )
+                            backoff_seconds *= 2
+                        time.sleep(sleep_time)
+                        continue
 
-            if resp.status_code == 404:
-                raise ghstack.github.NotFoundError(
-                    """\
+                if resp.status_code == 401:
+                    raise RuntimeError(
+                        "GitHub API returned 401 Unauthorized. Your OAuth token may be invalid or expired. "
+                        "For private repositories, make sure your token has the 'repo' scope."
+                    )
+
+                if resp.status_code == 404:
+                    raise ghstack.github.NotFoundError(
+                        """\
 GitHub raised a 404 error on the request for
 {url}.
 Usually, this doesn't actually mean the page doesn't exist; instead, it
 usually means that you didn't configure your OAuth token with enough
 permissions.  Please create a new OAuth token at
 https://{github_url}/settings/tokens and DOUBLE CHECK that you checked
-"public_repo" for permissions, and update ~/.ghstackrc with your new
-value.
+"public_repo" for permissions, or "repo" for private repository access.
+Update ~/.ghstackrc with your new token value.
+
+For private repositories, make sure your token has the full "repo" scope,
+not just "public_repo".
 """.format(
-                        url=url, github_url=self.github_url
+                            url=url, github_url=self.github_url
+                        )
                     )
-                )
 
-            try:
+                try:
+                    r = resp.json()
+                except ValueError as e:
+                    logging.error(f"Failed to parse JSON response: {str(e)}")
+                    logging.error(f"Response text: {resp.text[:1000]}")  # Limit to first 1000 chars
+                    
+                    # Check if response might be HTML (often an error page)
+                    if resp.text.strip().startswith(("<!DOCTYPE", "<html")):
+                        logging.error("Response appears to be HTML instead of JSON - likely an error page")
+                        
+                        # Extract title if possible for more context
+                        title_match = re.search(r"<title>(.*?)</title>", resp.text, re.DOTALL)
+                        if title_match:
+                            error_title = title_match.group(1).strip()
+                            logging.error(f"Error page title: {error_title}")
+                    
+                    raise RuntimeError(
+                        "GitHub API returned a non-JSON response. This could indicate:\n"
+                        "1. Network connectivity issues\n"
+                        "2. Authentication problems with your OAuth token\n"
+                        "3. GitHub API endpoint might be incorrect or unavailable\n\n"
+                        f"Status code: {resp.status_code}"
+                    ) from e
+                
+                pretty_json = json.dumps(r, indent=1)
+                logging.debug("Response JSON:\n{}".format(pretty_json))
+
                 resp.raise_for_status()
-            except requests.HTTPError:
-                raise RuntimeError(pretty_json)
+                return r
+            
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Request exception on attempt {attempt+1}/{MAX_RETRIES}: {str(e)}")
+                if hasattr(e, 'response') and e.response is not None:
+                    logging.error(f"Response status: {e.response.status_code}")
+                    logging.error(f"Response text: {e.response.text[:1000]}")
+                
+                # If this is the last retry, raise the error
+                if attempt == MAX_RETRIES - 1:
+                    raise RuntimeError(
+                        f"Failed to connect to GitHub API after {MAX_RETRIES} attempts: {str(e)}\n"
+                        "Please check your network connection and GitHub API endpoint configuration."
+                    ) from e
+                
+                # Otherwise, wait before retrying
+                sleep_time = backoff_seconds * (attempt + 1)
+                logging.warning(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
 
-            return r
-
+        # This line should not be reached but is here for completeness
         raise RuntimeError("Exceeded maximum retries due to GitHub rate limiting")

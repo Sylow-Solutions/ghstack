@@ -2,6 +2,7 @@
 
 import re
 from typing import Optional
+import logging
 
 from typing_extensions import TypedDict
 
@@ -26,25 +27,42 @@ def get_github_repo_name_with_owner(
 ) -> GitHubRepoNameWithOwner:
     # Grovel in remotes to figure it out
     remote_url = sh.git("remote", "get-url", remote_name)
-    while True:
-        match = r"^git@{github_url}:/?([^/]+)/(.+?)(?:\.git)?$".format(
-            github_url=github_url
-        )
-        m = re.match(match, remote_url)
-        if m:
-            owner = m.group(1)
-            name = m.group(2)
-            break
-        search = r"{github_url}/([^/]+)/(.+?)(?:\.git)?$".format(github_url=github_url)
-        m = re.search(search, remote_url)
-        if m:
-            owner = m.group(1)
-            name = m.group(2)
-            break
-        raise RuntimeError(
-            "Couldn't determine repo owner and name from url: {}".format(remote_url)
-        )
-    return {"owner": owner, "name": name}
+    logging.debug(f"Parsing remote URL: {remote_url}")
+    
+    # Handle SSH format (git@github.com:owner/repo.git)
+    ssh_pattern = re.compile(r'^git@[^:]+:([^/]+)/([^.]+)(?:\.git)?$')
+    m = ssh_pattern.match(remote_url)
+    if m:
+        owner = m.group(1)
+        name = m.group(2)
+        logging.debug(f"Parsed SSH URL: owner={owner}, name={name}")
+        return {"owner": owner, "name": name}
+    
+    # Handle HTTPS format (https://github.com/owner/repo.git)
+    https_pattern = re.compile(r'https://[^/]+/([^/]+)/([^.]+)(?:\.git)?$')
+    m = https_pattern.match(remote_url)
+    if m:
+        owner = m.group(1)
+        name = m.group(2)
+        logging.debug(f"Parsed HTTPS URL: owner={owner}, name={name}")
+        return {"owner": owner, "name": name}
+    
+    # Handle HTTPS with auth token (https://x-access-token:TOKEN@github.com/owner/repo.git)
+    auth_pattern = re.compile(r'https://x-access-token:[^@]+@[^/]+/([^/]+)/([^.]+)(?:\.git)?$')
+    m = auth_pattern.match(remote_url)
+    if m:
+        owner = m.group(1)
+        name = m.group(2)
+        logging.debug(f"Parsed HTTPS auth URL: owner={owner}, name={name}")
+        return {"owner": owner, "name": name}
+    
+    # If we get here, none of our patterns matched
+    raise RuntimeError(
+        f"Couldn't determine repo owner and name from url: {remote_url}\n"
+        f"Please ensure your git remote URL is in one of the following formats:\n"
+        f"  SSH: git@github.com:owner/repo.git\n"
+        f"  HTTPS: https://github.com/owner/repo.git"
+    )
 
 
 GitHubRepoInfo = TypedDict(

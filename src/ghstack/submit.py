@@ -5,6 +5,7 @@ import itertools
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -1791,6 +1792,7 @@ is closed (likely due to being merged).  Please rebase to upstream and try again
     def _git_push(self, branches: Sequence[str], force: bool = False) -> None:
         assert branches, "empty branches would push master, probably bad!"
         try:
+            # First attempt normal push
             self.sh.git(
                 "push",
                 self.remote_name,
@@ -1800,11 +1802,48 @@ is closed (likely due to being merged).  Please rebase to upstream and try again
             )
         except RuntimeError as e:
             remote_url = self.sh.git("remote", "get-url", "--push", self.remote_name)
+            
             if remote_url.startswith("https://"):
+                # For private repos, try using OAuth token
+                if hasattr(self.github, 'oauth_token') and self.github.oauth_token:
+                    logging.info("Attempting to push using OAuth token authentication...")
+                    
+                    # Create a temporary remote with authentication
+                    temp_remote_name = f"ghstack-temp-{int(time.time())}"
+                    auth_url = f"https://x-access-token:{self.github.oauth_token}@{self.github_url}/{self.repo_owner}/{self.repo_name}.git"
+                    
+                    try:
+                        # Add temporary remote with token
+                        self.sh.git("remote", "add", temp_remote_name, auth_url)
+                        
+                        # Push to the temporary remote
+                        self.sh.git(
+                            "push",
+                            temp_remote_name,
+                            "--no-verify",
+                            *(["--force"] if force else []),
+                            *branches,
+                        )
+                        
+                        # Success - notify the hook
+                        self.github.push_hook(branches)
+                        return
+                    except RuntimeError:
+                        # Still failed, fall through to original error
+                        pass
+                    finally:
+                        # Cleanup
+                        try:
+                            self.sh.git("remote", "remove", temp_remote_name)
+                        except RuntimeError:
+                            pass
+                
+                # If we got here, the push failed even with token
                 raise RuntimeError(
                     "[E001] git push failed, probably because it asked for password "
-                    "(scroll up to see original error).  "
-                    "Change your git URL to use SSH instead of HTTPS to enable passwordless push.  "
+                    "(scroll up to see original error). For private repositories, "
+                    "make sure your OAuth token has the correct permissions. "
+                    "You can also change your git URL to use SSH instead of HTTPS to enable passwordless push. "
                     "See https://github.com/ezyang/ghstack/wiki/E001 for more details."
                 ) from e
             raise

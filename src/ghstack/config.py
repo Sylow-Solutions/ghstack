@@ -83,6 +83,16 @@ def read_config(
 
     if config.has_option("ghstack", "github_url"):
         github_url = config.get("ghstack", "github_url")
+        if '/' in github_url:
+            logging.warning(f"Invalid github_url '{github_url}' - it should be just the domain (e.g., 'github.com')")
+            # Try to extract just the domain
+            if github_url.startswith(('http://', 'https://')):
+                github_url = github_url.split('/')[2]
+            else:
+                github_url = github_url.split('/')[0]
+            logging.warning(f"Correcting github_url to '{github_url}'")
+            config.set("ghstack", "github_url", github_url)
+            write_back = True
     else:
         github_url = input("GitHub enterprise domain (leave blank for OSS GitHub): ")
         if not github_url:
@@ -111,7 +121,7 @@ def read_config(
         res = requests.post(
             f"https://{github_url}/login/device/code",
             headers={"Accept": "application/json"},
-            data={"client_id": CLIENT_ID, "scope": "repo"},
+            data={"client_id": CLIENT_ID, "scope": "repo"},  # 'repo' grants access to private repositories
         )
         data = res.json()
         print(f"User verification code: {data['user_code']}")
@@ -131,6 +141,7 @@ def read_config(
         github_oauth = res.json()["access_token"]
         config.set("ghstack", "github_oauth", github_oauth)
         write_back = True
+        print("Access token generated with 'repo' scope, which includes private repository access.")
     if github_oauth is not None:
         ghstack.logs.formatter.redact(github_oauth, "<GITHUB_OAUTH>")
 
